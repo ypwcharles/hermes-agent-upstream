@@ -6,6 +6,7 @@ from the same session and aggregate them before dispatching.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,9 +26,12 @@ def _make_adapter():
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
     adapter._text_batch_delay_seconds = 0.1  # fast for tests
+    adapter._text_batch_split_delay_seconds = 0.3  # fast for split-message tests
     adapter._active_sessions = {}
     adapter._pending_messages = {}
     adapter._message_handler = AsyncMock()
+    adapter._should_process_message = MagicMock(return_value=True)
+    adapter._bot = None
     adapter.handle_message = AsyncMock()
     return adapter
 
@@ -108,6 +112,46 @@ class TestTextBatching:
         await asyncio.sleep(0.2)
 
         assert adapter.handle_message.call_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("command_name", "continuation_text"),
+        [
+            ("queue", "and this is the queued continuation chunk"),
+            ("background", "and this is the background continuation chunk"),
+            ("btw", "and this is the btw continuation chunk"),
+            ("plan", "and this is the plan continuation chunk"),
+        ],
+    )
+    async def test_long_command_split_is_aggregated_before_dispatch(self, command_name, continuation_text):
+        """Long slash commands with free-form args should wait for TEXT continuations."""
+        adapter = _make_adapter()
+        long_command = f"/{command_name} " + ("A" * 4010)
+        command_event = MessageEvent(
+            text=long_command,
+            message_type=MessageType.COMMAND,
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
+        )
+        continuation_event = _make_event(continuation_text)
+
+        command_update = SimpleNamespace(update_id=1, message=SimpleNamespace(text=long_command))
+        text_update = SimpleNamespace(update_id=2, message=SimpleNamespace(text=continuation_event.text))
+        adapter._build_message_event = MagicMock(side_effect=[command_event, continuation_event])
+
+        await adapter._handle_command(command_update, None)
+        adapter.handle_message.assert_not_called()
+
+        await asyncio.sleep(0.05)
+        await adapter._handle_text_message(text_update, None)
+        adapter.handle_message.assert_not_called()
+
+        await asyncio.sleep(0.35)
+
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert dispatched.message_type == MessageType.COMMAND
+        assert dispatched.text.startswith(f"/{command_name} ")
+        assert continuation_text in dispatched.text
 
     @pytest.mark.asyncio
     async def test_batch_cleans_up_after_flush(self):

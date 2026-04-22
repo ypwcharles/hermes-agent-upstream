@@ -2375,6 +2375,26 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         self._enqueue_text_event(event)
     
+    def _should_batch_command_event(self, event: MessageEvent) -> bool:
+        """Return True when a slash command should wait for Telegram split follow-ups.
+
+        Telegram routes the first chunk of a long slash command through the COMMAND
+        handler, but any continuation chunks arrive as plain TEXT updates. If we
+        dispatch the first chunk immediately, later chunks can be misinterpreted as
+        a brand-new follow-up. Batch only commands whose semantics depend on
+        preserving long free-form arguments across Telegram's client-side splits.
+        """
+        cmd = event.get_command()
+        if not cmd:
+            return False
+        try:
+            from hermes_cli.commands import resolve_command as _resolve_gateway_command
+            _cmd_def = _resolve_gateway_command(cmd)
+        except Exception:
+            _cmd_def = None
+        canonical_cmd = _cmd_def.name if _cmd_def else cmd
+        return canonical_cmd in {"queue", "background", "btw", "plan"} and utf16_len(event.text or "") >= self._SPLIT_THRESHOLD
+
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
         if not update.message or not update.message.text:
@@ -2383,6 +2403,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         
         event = self._build_message_event(update.message, MessageType.COMMAND, update_id=update.update_id)
+        if self._should_batch_command_event(event):
+            self._enqueue_text_event(event)
+            return
         await self.handle_message(event)
     
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
